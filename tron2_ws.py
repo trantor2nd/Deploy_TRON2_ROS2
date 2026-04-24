@@ -41,9 +41,9 @@ import websocket
 # ---------------------------------------------------------------------------
 
 ROBOT_IP = "10.192.1.2"
-MOVE_TIME = 0.2            # request_movej.time field, seconds
-SEND_INTERVAL = 0.2        # pause between successive movej sends, seconds
-MAX_JOINT_STEP = 0.05      # max per-send delta on any joint; Tron2 safety caps
+MOVE_TIME = 0.1            # request_movej.time field, seconds
+SEND_INTERVAL = 0.1        # pause between successive movej sends, seconds
+MAX_JOINT_STEP = 0.1     # max per-send delta on any joint; Tron2 safety caps
 
 # Hold duration at each warmup landmark (lets the hardware physically arrive).
 WARMUP_HOLD_SECONDS = 3.0
@@ -52,12 +52,12 @@ WARMUP_HOLD_SECONDS = 3.0
 #   WP1: yaw_L/yaw_R opened symmetrically
 #   WP2: yaws still open, knees folded
 #   WP3: yaws returned to zero, knees folded — the operating pose
-WARMUP_WAYPOINT_1 = [0.0, 0.0, 1.35, 0.0, 0.0, 0.0, 0.0,
-                     0.0, 0.0, -1.35, 0.0, 0.0, 0.0, 0.0]
-WARMUP_WAYPOINT_2 = [0.0, 0.0, 1.35, -1.6, 0.0, 0.0, 0.0,
-                     0.0, 0.0, -1.35, -1.6, 0.0, 0.0, 0.0]
-WARMUP_WAYPOINT_3 = [0.0, 0.0, 0.0, -1.6, 0.0, 0.0, 0.0,
-                     0.0, 0.0, 0.0, -1.6, 0.0, 0.0, 0.0]
+WARMUP_WAYPOINT_1 = [0.0, 0.23, 1.35, 0.0, 0.0, 0.0, 0.0,
+                     0.0, -0.23, -1.35, 0.0, 0.0, 0.0, 0.0]
+WARMUP_WAYPOINT_2 = [0.0, 0.23, 1.35, -1.6, 0.0, 0.0, 0.0,
+                     0.0, -0.23, -1.35, -1.6, 0.0, 0.0, 0.0]
+WARMUP_WAYPOINT_3 = [0.0, 0.23, 0.0, -1.6, 0.0, 0.0, 0.0,
+                     0.0, -0.23, 0.0, -1.6, 0.0, 0.0, 0.0]
 
 
 # ---------------------------------------------------------------------------
