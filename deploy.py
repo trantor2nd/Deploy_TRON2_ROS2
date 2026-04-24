@@ -9,10 +9,10 @@ WP3 (see tron2_ws.WARMUP_WAYPOINT_3). Run order:
     python shutdown.py  # park the arm
 
 Each cycle: read /joint_states + three CompressedImage frames, run GR00T,
-then for every step of the returned action chunk rate-limit the movej send
-to ≤MAX_JOINT_STEP per-joint delta from the previous commanded value. Without
-that rate limit the robot silently rejects anything that jumps more than ~0.05
-rad in a single movej — same constraint the warmup walks around.
+then send every step of the returned action chunk directly as a movej —
+no MAX_JOINT_STEP rate limiting. Note: Tron2's safety layer will silently
+drop any movej whose per-joint delta exceeds ~0.05 rad from the previously
+commanded value, so large jumps (e.g. WP3 → chunk[0]) may be ignored.
 
 Left arm (j0..j6) is sign-flipped before going over the WebSocket: the training
 dataset and /joint_states use one sign convention, request_movej for the left
@@ -155,9 +155,7 @@ def inference_task():
         infer_ms = (time.monotonic() - t0) * 1000
         print(f"[cycle {cycle}] CHUNK K={len(chunk)} infer={infer_ms:.0f}ms")
 
-        # Each chunk step: rate-limit so no movej ever exceeds MAX_JOINT_STEP
-        # from the previously commanded joint_values. The first step may need
-        # many sub-sends if the model predicts far from WP3.
+        # Send each chunk step directly, no MAX_JOINT_STEP rate limiting.
         for k, cmd in enumerate(chunk):
             if tron2_ws.should_exit:
                 return
@@ -165,33 +163,22 @@ def inference_task():
             # Left arm (j0..j6) WS sign is opposite to dataset convention.
             target_joint = [float(x) for x in cmd[:14]]
             reverse_indices = [0, 1, 2, 3, 5, 6, 8, 9, 13]
-
-            # 对指定的索引位置进行反转
             for idx in reverse_indices:
                 target_joint[idx] = -target_joint[idx]
-                
+
             if cmd.shape[0] >= 16:
                 tron2_ws.gripper_values = [float(cmd[14]) * 100.0, float(cmd[15]) * 100.0]
 
-            tgt_str = "[" + ",".join(f"{x:+.4f}" for x in target_joint) + "]"
             delta_now = max(abs(t - j) for t, j in zip(target_joint, tron2_ws.joint_values))
+            tron2_ws.joint_values = target_joint
+            tgt_str = "[" + ",".join(f"{x:+.4f}" for x in target_joint) + "]"
             print(f"[cycle {cycle}][step {k+1:2d}/{len(chunk)}] "
-                  f"target={tgt_str} max|Δ|={delta_now:.3f} "
+                  f"send={tgt_str} max|Δ|={delta_now:.3f} "
                   f"grip=L{tron2_ws.gripper_values[0]:.1f},R{tron2_ws.gripper_values[1]:.1f}")
-
-            sub = 0
-            while not tron2_ws.should_exit:
-                reached = tron2_ws.step_toward(target_joint, tron2_ws.MAX_JOINT_STEP)
-                sub += 1
-                js = "[" + ",".join(f"{x:+.4f}" for x in tron2_ws.joint_values) + "]"
-                print(f"  sub {sub:2d}{' [REACHED]' if reached else ''} "
-                      f"send joint={js}")
-                tron2_ws.send_movej()
-                if cmd.shape[0] >= 16:
-                    tron2_ws.send_gripper()
-                time.sleep(tron2_ws.SEND_INTERVAL)
-                if reached:
-                    break
+            tron2_ws.send_movej()
+            if cmd.shape[0] >= 16:
+                tron2_ws.send_gripper()
+            time.sleep(tron2_ws.SEND_INTERVAL)
 
 
 if __name__ == "__main__":
