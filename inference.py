@@ -182,17 +182,25 @@ class GR00TRunner:
             raise RuntimeError(f"Unexpected action chunk shape: {tuple(raw.shape)}")
         K = raw.shape[1]
 
-        # Per-step postprocessing is REQUIRED with lerobot 0.4.4 +
-        # groot_action_unpack_unnormalize_v1: when fed a (1, K, D) tensor, the
-        # unpack step collapses the chunk dim and returns (1, env_action_dim).
-        # Feeding each step separately preserves the chunk. Verified against
-        # dataset GT: MAE/range ≈ 1–3% per joint (test_infer_on_dataset.py).
-        steps = []
-        for k in range(K):
-            single = raw[:, k, :]                                    # (1, max_action_dim)
-            out = self.post(single)["action"]                        # (1, env_action_dim=16)
-            steps.append(out.reshape(-1))
-        action = torch.stack(steps, dim=0)                           # (K, 16)
+        # Feed the full (1, K, D) chunk to the postprocessor at once.
+        # This avoids K separate Python calls and matches the bulk path
+        # validated in test_infer_on_dataset.py.
+        try:
+            out = self.post(raw)["action"]                           # (1, K, 16) or (K, 16)
+            if out.dim() == 3:
+                action = out.squeeze(0)                               # (K, 16)
+            elif out.dim() == 2:
+                action = out
+            else:
+                raise ValueError(f"unexpected post shape {tuple(out.shape)}")
+        except Exception:
+            # Fallback: per-step postprocessing (lerobot 0.4.4 compat).
+            steps = []
+            for k in range(K):
+                single = raw[:, k, :]
+                out_k = self.post(single)["action"]
+                steps.append(out_k.reshape(-1))
+            action = torch.stack(steps, dim=0)
         return action.detach().cpu().numpy().astype(np.float32)
 
 

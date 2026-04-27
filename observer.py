@@ -180,13 +180,18 @@ def wait_for_fresh_observation(
     observer: Tron2Observer,
     log: logging.Logger,
     stop_event: threading.Event,
-    min_obs_age: float = 0.5,
+    max_obs_age: float = 0.5,
+    max_img_age: float = 0.2,
 ):
-    """Block until all topics are populated and the joint timestamp is fresh.
+    """Block until all topics are populated and both joints and images are fresh.
 
     Returns ``(names, state, frames, joint_stamp)`` on success or ``None`` if
     ``stop_event`` fired or rclpy shut down while waiting. Logs a what-is-missing
     heartbeat every 2 s so the user can see which topic is lagging.
+
+    Images are checked against ``max_img_age`` so the snapshot used for
+    inference is temporally coherent — joints and cameras within the same
+    window.
     """
     last_heartbeat = 0.0
     while not stop_event.is_set() and rclpy.ok():
@@ -210,9 +215,18 @@ def wait_for_fresh_observation(
             continue
 
         names, state, joint_stamp = joint
-        if now - joint_stamp > min_obs_age:
+        age_joint = now - joint_stamp
+        stale = age_joint > max_obs_age
+        for n, (f, stamp) in frames.items():
+            if now - stamp > max_img_age:
+                stale = True
+                break
+        if stale:
             if now - last_heartbeat > 2.0:
-                log.warning(f"stale joint state (age={now-joint_stamp:.2f}s)")
+                ages = f"joint={age_joint:.2f}s"
+                for n2, (_, s2) in frames.items():
+                    ages += f" {n2}={now-s2:.2f}s"
+                log.warning(f"observation too stale: {ages}")
                 last_heartbeat = now
             time.sleep(0.02)
             continue

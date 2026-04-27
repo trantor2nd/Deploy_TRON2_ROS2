@@ -49,8 +49,8 @@ from inference import GR00TRunner
 # ---- GR00T / ROS config ----
 CHECKPOINT = Path(os.environ.get(
     "TRON2_CKPT",
-    "/home/data/hf/hub/models--trantor2nd--tron2-pickup-gr00t/"
-    "snapshots/007a769f46218f62e1d5a7e3fb3eb176716b03ce",
+    "/home/data/hf/hub/models--trantor2nd--tron2-pickup-gr00t-2epoch/"
+    "snapshots/aad6050b59b9b8cd59fdccc5d641817dec5f07c6",
 ))
 DEVICE = "cuda:0"
 TASK_TEXT = "pick_up_stones_and_place_them_into_the_container"
@@ -121,21 +121,74 @@ def inference_task():
         print("[infer] joint name schema mismatch — aborting")
         return
 
-    # --- 6. Main inference loop ---
+    # --- 6. Two-thread pump: send thread + inference thread ---
+    # The send thread plays each chunk at 10 Hz and fires `chunk_done` when
+    # the last step is dispatched. The inference thread waits for `chunk_done`,
+    # captures a fresh (synchronized) observation, and runs GR00T — so the
+    # observation is always taken at the end of the previous chunk, not at
+    # the start.
+    chunk_done = threading.Event()
+    chunk_done.set()  # allow first inference immediately
+
+    # Shared state between inference and send threads.
+    current_chunk = None
+    chunk_lock = threading.Lock()
+
+    reverse_indices = [0, 1, 2, 3, 5, 6, 8, 9, 13]
+
+    def _apply_chunk(cmd: np.ndarray):
+        """Send one step of a chunk over WebSocket."""
+        target_joint = [float(x) for x in cmd[:14]]
+        for idx in reverse_indices:
+            target_joint[idx] = -target_joint[idx]
+        if cmd.shape[0] >= 16:
+            tron2_ws.gripper_values = [float(cmd[14]) * 100.0, float(cmd[15]) * 100.0]
+        delta_now = max(abs(t - j) for t, j in zip(target_joint, tron2_ws.joint_values))
+        tron2_ws.joint_values = target_joint
+
+    def send_thread_fn():
+        """Play out whichever chunk is set in ``current_chunk`` at 10 Hz."""
+        with chunk_lock:
+            chunk = current_chunk
+        if chunk is None:
+            return
+        K = len(chunk)
+        for k in range(K):
+            if tron2_ws.should_exit:
+                break
+            cmd = chunk[k]
+            _apply_chunk(cmd)
+            tgt_str = "[" + ",".join(
+                f"{x:+.4f}" for x in tron2_ws.joint_values
+            ) + "]"
+            print(f"[send][{k+1:2d}/{K}] "
+                  f"joint={tgt_str} "
+                  f"grip=L{tron2_ws.gripper_values[0]:.1f},R{tron2_ws.gripper_values[1]:.1f}")
+            tron2_ws.send_movej()
+            if cmd.shape[0] >= 16:
+                tron2_ws.send_gripper()
+            time.sleep(tron2_ws.SEND_INTERVAL)
+        chunk_done.set()
+
     cycle = 0
     while not tron2_ws.should_exit:
-        if cycle > 0:  # first cycle reuses `obs` captured above
-            obs = wait_for_fresh_observation(observer, log, stop_event)
-            if obs is None:
-                break
-            names, state, frames, _ = obs
+        # Wait for the previous chunk to finish before inferring the next one.
+        # First iteration: chunk_done is already set.
+        chunk_done.clear()
+        with chunk_lock:
+            current_chunk = None
+
+        cycle += 1
+        arm_str = ""  # placeholder; filled after obs arrives
+        obs = wait_for_fresh_observation(observer, log, stop_event)
+        if obs is None:
+            break
+        names, state, frames, _ = obs
 
         state16_raw = state.astype(np.float32)[reorder_idx][:16]
         state_for_model = state16_raw.copy()
-        # /gripper_state is 0–100, dataset stored opening/100 → divide before model.
         state_for_model[14:16] = state_for_model[14:16] / 100.0
 
-        cycle += 1
         arm_str = "[" + ",".join(f"{x:+.4f}" for x in state16_raw[:14]) + "]"
         print(f"\n[cycle {cycle}] STATE arm={arm_str} "
               f"grip=L{state16_raw[14]:.1f},R{state16_raw[15]:.1f}")
@@ -150,35 +203,14 @@ def inference_task():
             )
         except Exception as exc:
             print(f"[infer] inference failed: {exc}")
-            time.sleep(0.3)
+            chunk_done.set()
             continue
         infer_ms = (time.monotonic() - t0) * 1000
         print(f"[cycle {cycle}] CHUNK K={len(chunk)} infer={infer_ms:.0f}ms")
 
-        # Send each chunk step directly, no MAX_JOINT_STEP rate limiting.
-        for k, cmd in enumerate(chunk):
-            if tron2_ws.should_exit:
-                return
-
-            # Left arm (j0..j6) WS sign is opposite to dataset convention.
-            target_joint = [float(x) for x in cmd[:14]]
-            reverse_indices = [0, 1, 2, 3, 5, 6, 8, 9, 13]
-            for idx in reverse_indices:
-                target_joint[idx] = -target_joint[idx]
-
-            if cmd.shape[0] >= 16:
-                tron2_ws.gripper_values = [float(cmd[14]) * 100.0, float(cmd[15]) * 100.0]
-
-            delta_now = max(abs(t - j) for t, j in zip(target_joint, tron2_ws.joint_values))
-            tron2_ws.joint_values = target_joint
-            tgt_str = "[" + ",".join(f"{x:+.4f}" for x in target_joint) + "]"
-            print(f"[cycle {cycle}][step {k+1:2d}/{len(chunk)}] "
-                  f"send={tgt_str} max|Δ|={delta_now:.3f} "
-                  f"grip=L{tron2_ws.gripper_values[0]:.1f},R{tron2_ws.gripper_values[1]:.1f}")
-            tron2_ws.send_movej()
-            if cmd.shape[0] >= 16:
-                tron2_ws.send_gripper()
-            time.sleep(tron2_ws.SEND_INTERVAL)
+        with chunk_lock:
+            current_chunk = chunk
+        threading.Thread(target=send_thread_fn, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ import websocket
 # ---------------------------------------------------------------------------
 
 ROBOT_IP = "10.192.1.2"
-MOVE_TIME = 0.1            # request_movej.time field, seconds
+MOVE_TIME = 0.2            # request_movej.time field, seconds
 SEND_INTERVAL = 0.1        # pause between successive movej sends, seconds
 MAX_JOINT_STEP = 0.1     # max per-send delta on any joint; Tron2 safety caps
 
