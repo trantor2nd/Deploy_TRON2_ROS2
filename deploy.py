@@ -49,8 +49,8 @@ from inference import GR00TRunner
 # ---- GR00T / ROS config ----
 CHECKPOINT = Path(os.environ.get(
     "TRON2_CKPT",
-    "/home/data/hf/hub/models--trantor2nd--tron2_gr00t_pick_step4k/"
-    "snapshots/392ac380af3080d1f5df3a075f6a2708b5e16277",
+    "/home/data/hf/hub/models--trantor2nd--tron2_gr00t_pick_step6k/"
+    "snapshots/64108047dc22892c31f84856b507009578be5e79",
 ))
 DEVICE = "cuda:0"
 TASK_TEXT = "pick_up_stones_and_place_them_into_the_container"
@@ -77,11 +77,12 @@ def inference_task():
     #     This does NOT move the arm; it just tells step_toward() what the
     #     "previous commanded value" is so sub-send deltas are correct.
     tron2_ws.joint_values = list(tron2_ws.WARMUP_WAYPOINT_3)
-    tron2_ws.gripper_values = [0.0, 0.0]
+    tron2_ws.gripper_values = [0.97*100.0, 0.0]
     print("[infer] rate-limiter anchored at WP3 (start.py must have run first)")
     tron2_ws.send_movej()
     time.sleep(tron2_ws.SEND_INTERVAL)
-
+    tron2_ws.send_gripper()
+    time.sleep(tron2_ws.SEND_INTERVAL)
     # --- 3. Start ROS observer ---
     rclpy.init()
     observer = Tron2Observer(

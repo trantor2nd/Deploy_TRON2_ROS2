@@ -41,7 +41,7 @@ import websocket
 # ---------------------------------------------------------------------------
 
 ROBOT_IP = "10.192.1.2"
-MOVE_TIME = 0.2            # request_movej.time field, seconds
+MOVE_TIME = 0.25            # request_movej.time field, seconds
 SEND_INTERVAL = 0.1        # pause between successive movej sends, seconds
 MAX_JOINT_STEP = 0.1     # max per-send delta on any joint; Tron2 safety caps
 
@@ -200,6 +200,10 @@ def warmup_sequence() -> None:
     hold(WARMUP_HOLD_SECONDS, "warmup-B")
     interp_send(WARMUP_WAYPOINT_2, WARMUP_WAYPOINT_3, "warmup-C")
     hold(WARMUP_HOLD_SECONDS, "warmup-C")
+    gripper_values = [0.97, 0.0]
+    print("[warmup] opening left gripper to 0.97")
+    send_gripper()
+    time.sleep(SEND_INTERVAL)
     print("[warmup] done — arm is at WP3")
 
 
