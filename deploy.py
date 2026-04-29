@@ -49,8 +49,8 @@ from inference import GR00TRunner
 # ---- GR00T / ROS config ----
 CHECKPOINT = Path(os.environ.get(
     "TRON2_CKPT",
-    "/home/data/hf/hub/models--trantor2nd--tron2-pickup-gr00t-2epoch/"
-    "snapshots/aad6050b59b9b8cd59fdccc5d641817dec5f07c6",
+    "/home/data/hf/hub/models--trantor2nd--tron2_gr00t_pick_step4k/"
+    "snapshots/392ac380af3080d1f5df3a075f6a2708b5e16277",
 ))
 DEVICE = "cuda:0"
 TASK_TEXT = "pick_up_stones_and_place_them_into_the_container"
