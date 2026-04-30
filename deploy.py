@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """GR00T inference loop for Tron2.
 
-Does NOT run any warmup. Assumes ``start.py`` has already walked the arm to
-WP3 (see tron2_ws.WARMUP_WAYPOINT_3). Run order:
+Assumes start.py has already walked the arm to WP3. Run order:
 
     python start.py     # once per power-on
     python deploy.py    # this file, until Ctrl+C
     python shutdown.py  # park the arm
 
-Each cycle: read /joint_states + three CompressedImage frames, run GR00T,
-then send every step of the returned action chunk directly as a movej —
-no MAX_JOINT_STEP rate limiting. Note: Tron2's safety layer will silently
-drop any movej whose per-joint delta exceeds ~0.05 rad from the previously
-commanded value, so large jumps (e.g. WP3 → chunk[0]) may be ignored.
+Each cycle (sequential, no threads):
+    1. Capture a fresh, synchronized observation (joint state + 3 cameras).
+    2. Run GR00T → action chunk (K, 16).
+    3. Send the first CONSUME_STEPS steps at 10 Hz, blocking until done.
+    4. Go to 1 — observe the state AFTER the chunk fully executed.
 
-Left arm (j0..j6) is sign-flipped before going over the WebSocket: the training
-dataset and /joint_states use one sign convention, request_movej for the left
-side uses the opposite.
-
-The WS plumbing (ACCID, ws_client, send_movej, etc.) is imported from
-``tron2_ws``, so deploy.py / start.py / shutdown.py all speak the same
-wire-level protocol as test.py.
+Left arm joints are sign-flipped before sending (dataset and /joint_states use
+one convention; request_movej for the left side uses the opposite).
 """
 
 from __future__ import annotations
@@ -30,7 +24,6 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Optional  # noqa: F401 (kept for future annotation use)
 
 import numpy as np
 import rclpy
@@ -46,7 +39,8 @@ from observer import (
 from inference import GR00TRunner
 
 
-# ---- GR00T / ROS config ----
+# ── config ────────────────────────────────────────────────────────────────────
+
 CHECKPOINT = Path(os.environ.get(
     "TRON2_CKPT",
     "/home/data/hf/hub/models--trantor2nd--tron2_gr00t_pick_step6k/"
@@ -55,6 +49,9 @@ CHECKPOINT = Path(os.environ.get(
 DEVICE = "cuda:0"
 TASK_TEXT = "pick_up_stones_and_place_them_into_the_container"
 BASE_MODEL_PATH = os.environ.get("BASE_MODEL_PATH")
+# Steps of each K-step chunk to actually drive; the rest are discarded and
+# re-inferred from the state observed after the chunk completes.
+CONSUME_STEPS = int(os.environ.get("TRON2_CONSUME_STEPS", "30"))
 
 JOINT_TOPIC = "/joint_states"
 GRIPPER_TOPIC = "/gripper_state"
@@ -62,28 +59,67 @@ CAM_LEFT = "/camera/left/color/image_rect_raw/compressed"
 CAM_HIGH = "/camera/top/color/image_raw/compressed"
 CAM_RIGHT = "/camera/right/color/image_rect_raw/compressed"
 
+# Left-arm joint indices whose sign convention differs between the dataset
+# and the robot's request_movej protocol.
+_LEFT_FLIP_IDX = [0, 1, 2, 3, 5, 6, 8, 9, 13]
 
-def inference_task():
-    log = logging.getLogger("infer")
 
-    # --- 1. Wait for the WS handshake ---
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _send_step(cmd: np.ndarray) -> None:
+    """Apply one (16,) action row: sign-flip left arm, then send movej + gripper."""
+    joints = [float(x) for x in cmd[:14]]
+    for i in _LEFT_FLIP_IDX:
+        joints[i] = -joints[i]
+    tron2_ws.joint_values = joints
+    tron2_ws.send_movej()
+    if cmd.shape[0] >= 16:
+        tron2_ws.gripper_values = [float(cmd[14]) * 100.0, float(cmd[15]) * 100.0]
+        tron2_ws.send_gripper()
+
+
+def _execute_chunk(chunk: np.ndarray, log: logging.Logger, cycle: int) -> None:
+    """Send each row of chunk at SEND_INTERVAL Hz, blocking until done."""
+    next_tick = time.monotonic()
+    for k, cmd in enumerate(chunk):
+        if tron2_ws.should_exit:
+            break
+        sleep = next_tick - time.monotonic()
+        if sleep > 0:
+            time.sleep(sleep)
+        _send_step(cmd)
+        joints_str = "[" + ",".join(f"{x:+.4f}" for x in tron2_ws.joint_values) + "]"
+        log.info(
+            f"[cycle {cycle}][{k+1:2d}/{len(chunk)}] "
+            f"joint={joints_str} "
+            f"grip=L{tron2_ws.gripper_values[0]:.1f},R{tron2_ws.gripper_values[1]:.1f}"
+        )
+        next_tick += tron2_ws.SEND_INTERVAL
+
+
+# ── main task ─────────────────────────────────────────────────────────────────
+
+def inference_task() -> None:
+    log = logging.getLogger("deploy")
+
+    # 1. Wait for WebSocket handshake.
     if not tron2_ws.wait_for_accid(timeout=15.0):
-        print("[infer] timeout waiting for accid — aborting")
+        log.error("timeout waiting for accid — aborting")
         tron2_ws.close()
         return
-    print(f"[infer] ACCID acquired = {tron2_ws.ACCID}")
+    log.info(f"ACCID = {tron2_ws.ACCID}")
 
-    # --- 2. Anchor the rate-limiter at WP3 (where start.py left the arm) ---
-    #     This does NOT move the arm; it just tells step_toward() what the
-    #     "previous commanded value" is so sub-send deltas are correct.
+    # 2. Anchor the rate-limiter at WP3 (start.py must have run first).
+    #    This does NOT move the arm; it tells send_movej what the previous
+    #    commanded value is so per-send deltas are computed correctly.
     tron2_ws.joint_values = list(tron2_ws.WARMUP_WAYPOINT_3)
-    tron2_ws.gripper_values = [0.97*100.0, 0.0]
-    print("[infer] rate-limiter anchored at WP3 (start.py must have run first)")
+    tron2_ws.gripper_values = [0.97 * 100.0, 0.0]
     tron2_ws.send_movej()
     time.sleep(tron2_ws.SEND_INTERVAL)
     tron2_ws.send_gripper()
     time.sleep(tron2_ws.SEND_INTERVAL)
-    # --- 3. Start ROS observer ---
+
+    # 3. Start ROS observer.
     rclpy.init()
     observer = Tron2Observer(
         joint_topic=JOINT_TOPIC,
@@ -97,103 +133,50 @@ def inference_task():
     executor = MultiThreadedExecutor()
     executor.add_node(observer)
     threading.Thread(target=executor.spin, daemon=True).start()
-    print("[infer] ROS observer spinning")
+    log.info("ROS observer spinning")
 
-    # --- 4. Load GR00T ---
+    # 4. Load GR00T.
     runner = GR00TRunner(
         checkpoint=CHECKPOINT,
         device=DEVICE,
         task_text=TASK_TEXT,
         base_model_path=BASE_MODEL_PATH,
     )
-    print("[infer] GR00T loaded")
+    log.info("GR00T loaded")
 
-    stop_event = threading.Event()
-
-    # --- 5. Resolve joint-name ordering once ---
-    print("[infer] waiting for first fresh observation…")
+    # 5. Resolve joint-name ordering once from the first live observation.
+    stop_event = threading.Event()  # never set; wait_for_fresh_observation also exits on rclpy shutdown
+    log.info("waiting for first observation…")
     obs = wait_for_fresh_observation(observer, log, stop_event)
     if obs is None:
         return
-    names, state, frames, _ = obs
+    names, _, _, _ = obs
     reorder_idx = build_state_reorder(names)
     log_reorder_once(log, names, reorder_idx)
     if reorder_idx is None:
-        print("[infer] joint name schema mismatch — aborting")
+        log.error("joint name schema mismatch — aborting")
         return
 
-    # --- 6. Two-thread pump: send thread + inference thread ---
-    # The send thread plays each chunk at 10 Hz and fires `chunk_done` when
-    # the last step is dispatched. The inference thread waits for `chunk_done`,
-    # captures a fresh (synchronized) observation, and runs GR00T — so the
-    # observation is always taken at the end of the previous chunk, not at
-    # the start.
-    chunk_done = threading.Event()
-    chunk_done.set()  # allow first inference immediately
-
-    # Shared state between inference and send threads.
-    current_chunk = None
-    chunk_lock = threading.Lock()
-
-    reverse_indices = [0, 1, 2, 3, 5, 6, 8, 9, 13]
-
-    def _apply_chunk(cmd: np.ndarray):
-        """Send one step of a chunk over WebSocket."""
-        target_joint = [float(x) for x in cmd[:14]]
-        for idx in reverse_indices:
-            target_joint[idx] = -target_joint[idx]
-        if cmd.shape[0] >= 16:
-            tron2_ws.gripper_values = [float(cmd[14]) * 100.0, float(cmd[15]) * 100.0]
-        delta_now = max(abs(t - j) for t, j in zip(target_joint, tron2_ws.joint_values))
-        tron2_ws.joint_values = target_joint
-
-    def send_thread_fn():
-        """Play out whichever chunk is set in ``current_chunk`` at 10 Hz."""
-        with chunk_lock:
-            chunk = current_chunk
-        if chunk is None:
-            return
-        K = len(chunk)
-        for k in range(K):
-            if tron2_ws.should_exit:
-                break
-            cmd = chunk[k]
-            _apply_chunk(cmd)
-            tgt_str = "[" + ",".join(
-                f"{x:+.4f}" for x in tron2_ws.joint_values
-            ) + "]"
-            print(f"[send][{k+1:2d}/{K}] "
-                  f"joint={tgt_str} "
-                  f"grip=L{tron2_ws.gripper_values[0]:.1f},R{tron2_ws.gripper_values[1]:.1f}")
-            tron2_ws.send_movej()
-            if cmd.shape[0] >= 16:
-                tron2_ws.send_gripper()
-            time.sleep(tron2_ws.SEND_INTERVAL)
-        chunk_done.set()
-
+    # 6. Main loop: observe → infer → execute → repeat.
     cycle = 0
     while not tron2_ws.should_exit:
-        # Wait for the previous chunk to finish before inferring the next one.
-        # First iteration: chunk_done is already set.
-        chunk_done.clear()
-        with chunk_lock:
-            current_chunk = None
-
         cycle += 1
-        arm_str = ""  # placeholder; filled after obs arrives
+
+        # ── Observe ──────────────────────────────────────────────────────────
         obs = wait_for_fresh_observation(observer, log, stop_event)
         if obs is None:
             break
         names, state, frames, _ = obs
 
         state16_raw = state.astype(np.float32)[reorder_idx][:16]
+        # Model expects arm in rad (already), gripper in 0–1 (divide robot's 0–100).
         state_for_model = state16_raw.copy()
-        state_for_model[14:16] = state_for_model[14:16] / 100.0
+        state_for_model[14:16] /= 100.0
 
         arm_str = "[" + ",".join(f"{x:+.4f}" for x in state16_raw[:14]) + "]"
-        print(f"\n[cycle {cycle}] STATE arm={arm_str} "
-              f"grip=L{state16_raw[14]:.1f},R{state16_raw[15]:.1f}")
+        log.info(f"[cycle {cycle}] STATE arm={arm_str} grip=L{state16_raw[14]:.1f},R{state16_raw[15]:.1f}")
 
+        # ── Infer ─────────────────────────────────────────────────────────────
         t0 = time.monotonic()
         try:
             chunk = runner.infer(
@@ -203,20 +186,17 @@ def inference_task():
                 state16=state_for_model,
             )
         except Exception as exc:
-            print(f"[infer] inference failed: {exc}")
-            chunk_done.set()
+            log.error(f"inference failed: {exc}")
             continue
-        infer_ms = (time.monotonic() - t0) * 1000
-        print(f"[cycle {cycle}] CHUNK K={len(chunk)} infer={infer_ms:.0f}ms")
+        log.info(f"[cycle {cycle}] CHUNK K={len(chunk)} infer={1000*(time.monotonic()-t0):.0f}ms")
 
-        with chunk_lock:
-            current_chunk = chunk
-        threading.Thread(target=send_thread_fn, daemon=True).start()
+        # ── Execute ───────────────────────────────────────────────────────────
+        drive_chunk = chunk[:CONSUME_STEPS]
+        log.info(f"[cycle {cycle}] executing {len(drive_chunk)}/{len(chunk)} steps")
+        _execute_chunk(drive_chunk, log, cycle)
 
 
 if __name__ == "__main__":
-    # Match oracle_realtime_deploy env: offline load + eager attention (the
-    # kernel path the checkpoint was trained with).
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("HF_USE_FLASH_ATTENTION_2", "0")
     os.environ.setdefault("USE_FLASH_ATTENTION", "0")
